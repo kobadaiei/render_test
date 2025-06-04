@@ -3,7 +3,7 @@ from pydantic import BaseModel
 import uuid
 import json
 import os
-import httpx
+# import httpx
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import redis
@@ -415,7 +415,3 @@ async def websocket_status():
         },
         "total_receipts_with_connections": len(manager.active_connections)
     }
-
-# if __name__ == "__main__":
-#     import uvicorn
-#     uvicorn.run(app, host="0.0.0.0", port=8000)
