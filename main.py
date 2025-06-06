@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uuid
 import json
@@ -23,6 +24,14 @@ REDIS_URL = os.environ['REDIS_URL']
 kv_store = redis.from_url(REDIS_URL)
 
 app = FastAPI(title="LLM Query Management API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # WebSocket connection manager
 class ConnectionManager:
