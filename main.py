@@ -17,12 +17,12 @@ import time
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# path = '/etc/secrets/.env'
-# # path = './.env'
-# load_dotenv(path)
-# REDIS_URL = os.environ['REDIS_URL']
+path = '/etc/secrets/.env'
+# path = './.env'
+load_dotenv(path)
+REDIS_URL = os.environ['REDIS_URL']
 # Render KV Store configuration
-REDIS_URL = 'rediss://red-d0uln8adbo4c73bgc2ug:XaFK6xsNkGyOq4DRUBN1viKpE6fYfIzQ@singapore-keyvalue.render.com:6379'
+# REDIS_URL = ''
 kv_store = redis.from_url(REDIS_URL)
 
 app = FastAPI(title="LLM Query Management API", version="1.0.0")
