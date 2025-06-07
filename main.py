@@ -11,16 +11,18 @@ import redis
 from dotenv import load_dotenv
 import asyncio
 import logging
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-path = '/etc/secrets/.env'
-# path = './.env'
-load_dotenv(path)
-REDIS_URL = os.environ['REDIS_URL']
+# path = '/etc/secrets/.env'
+# # path = './.env'
+# load_dotenv(path)
+# REDIS_URL = os.environ['REDIS_URL']
 # Render KV Store configuration
+REDIS_URL = 'rediss://red-d0uln8adbo4c73bgc2ug:XaFK6xsNkGyOq4DRUBN1viKpE6fYfIzQ@singapore-keyvalue.render.com:6379'
 kv_store = redis.from_url(REDIS_URL)
 
 app = FastAPI(title="LLM Query Management API", version="1.0.0")
@@ -56,6 +58,7 @@ class ConnectionManager:
     
     async def send_answer(self, receipt_number: str, answer_data: dict):
         """Send answer to all clients waiting for this receipt number"""
+
         if receipt_number in self.active_connections:
             connections_to_remove = []
             for connection in self.active_connections[receipt_number]:
@@ -74,7 +77,72 @@ class ConnectionManager:
             if not self.active_connections[receipt_number]:
                 del self.active_connections[receipt_number]
 
+            status = answer_data["data"]["status"]
+            if status == "completed":
+                await kv_delete(receipt_number)
+                logger.info(f"Receipt number {receipt_number} deleted")
+
+class LLMConnectionManager:
+    """Manages WebSocket connections for LLM servers"""
+    def __init__(self):
+        # Store active LLM server connections
+        self.active_connections: List[WebSocket] = []
+        self.connection_info: Dict[WebSocket, Dict[str, Any]] = {}
+    
+    async def connect(self, websocket: WebSocket, server_id: str = None):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        self.connection_info[websocket] = {
+            "server_id": server_id or f"llm_server_{len(self.active_connections)}",
+            "connected_at": datetime.utcnow().isoformat(),
+            "queries_sent": 0
+        }
+        logger.info(f"LLM server connected: {self.connection_info[websocket]['server_id']}")
+    
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            server_info = self.connection_info.get(websocket, {})
+            server_id = server_info.get("server_id", "unknown")
+            self.active_connections.remove(websocket)
+            if websocket in self.connection_info:
+                del self.connection_info[websocket]
+            logger.info(f"LLM server disconnected: {server_id}")
+    
+    async def send_query_to_available_server(self, query_data: dict) -> bool:
+        """Send query to an available LLM server using round-robin"""
+        if not self.active_connections:
+            logger.warning("No LLM servers available to process query")
+            return False
+        
+        # Simple round-robin selection (you can implement more sophisticated load balancing)
+        connection = self.active_connections[0]
+        # Move the connection to the end for round-robin
+        self.active_connections.append(self.active_connections.pop(0))
+        
+        try:
+            await connection.send_json({
+                "type": "query",
+                "data": query_data
+            })
+            
+            # Update statistics
+            if connection in self.connection_info:
+                self.connection_info[connection]["queries_sent"] += 1
+            
+            logger.info(f"Query sent to LLM server: {query_data['receipt_number']}")
+            return True
+        except Exception as e:
+            logger.error(f"Error sending query to LLM server: {e}")
+            # Remove the failed connection
+            self.disconnect(connection)
+            
+            # Try with next available server if any
+            if self.active_connections:
+                return await self.send_query_to_available_server(query_data)
+            return False
+
 manager = ConnectionManager()
+llm_manager = LLMConnectionManager()
 
 class AnswerRequest(BaseModel):
     receipt_number: str
@@ -123,6 +191,19 @@ async def kv_delete(key: str) -> bool:
     except Exception as e:
         logger.error(f"Error deleting key {key}: {e}")
         return False
+    
+async def get_pending_count():
+    """Redisを使用してpending状態のアイテム数を効率的に取得"""
+    try:
+        count = 0
+        for key in kv_store.scan_iter(match="*"):
+            data = kv_store.get(key)
+            if data and json.loads(data)["status"] == "pending":
+                count += 1
+        return count
+    except Exception as e:
+        logger.error(f"Error getting pending count: {e}")
+        return 0
 
 async def get_pending_items() -> Optional[Dict]:
     """Get the oldest pending item from the queue"""
@@ -130,6 +211,7 @@ async def get_pending_items() -> Optional[Dict]:
         oldest_item = None
         oldest_timestamp = None
         oldest_key = None
+        pending_count = 0
         
         for key_bytes in kv_store.scan_iter():
             key = key_bytes.decode() if isinstance(key_bytes, bytes) else str(key_bytes)
@@ -143,11 +225,12 @@ async def get_pending_items() -> Optional[Dict]:
                             oldest_item = item
                             oldest_timestamp = item_timestamp
                             oldest_key = key
+                            pending_count += 1
             except (json.JSONDecodeError, KeyError, ValueError) as e:
                 logger.error(f"Error processing item {key}: {e}")
                 continue
         
-        return (oldest_key, oldest_item) if oldest_item else None
+        return (oldest_key, oldest_item, pending_count) if oldest_item else None
     except Exception as e:
         logger.error(f"Error get_pending_items: {e}")
         return None
@@ -220,12 +303,66 @@ async def websocket_endpoint(websocket: WebSocket, receipt_number: str):
     finally:
         manager.disconnect(websocket, receipt_number)
 
+# WebSocket endpoint for LLM servers
+@app.websocket("/llm_ws/{server_id}")
+async def llm_websocket_endpoint(websocket: WebSocket, server_id: str):
+    global pending_count
+    
+    await llm_manager.connect(websocket, server_id)
+    try:
+        while True:
+            try:
+                # Listen for messages from LLM serverd
+                message = await websocket.receive_json()
+
+                # Get the oldest pending item
+                if pending_count > 0:
+                    pending_result = await get_pending_items()
+                else:
+                    pending_result = None
+
+                if None != pending_result:
+                    queue_key, queue_item, count = pending_result
+                    await set_pending_count(count)
+
+                    # Mark the item as processing
+                    queue_item["status"] = "processing"
+                    await kv_set(queue_key, json.dumps(queue_item))
+
+                    # Notify WebSocket clients about status change
+                    status_message = {
+                        "type": "status",
+                        "receipt_number": queue_item["receipt_number"],
+                        "data": {
+                            "status": "processing",
+                            "timestamp": queue_item["timestamp"]
+                        }
+                    }
+                    await websocket.send_json(status_message)
+                    await sub_pending_count()
+                    return
+                else:
+                    await set_pending_count(0)
+
+                # 各処理の後に短い待機を追加
+                await asyncio.sleep(1)  # 100ミリ秒の待機
+                    
+            except WebSocketDisconnect:
+                logger.info(f"LLM server {server_id} disconnected")
+                break
+            except Exception as e:
+                logger.error(f"LLM WebSocket error for server {server_id}: {e}")
+                await asyncio.sleep(1)  # エラー時は長めの待機
+    finally:
+        llm_manager.disconnect(websocket)
+
 # API Endpoints
 @app.post("/set_query", response_model=QueueItem)
 async def set_query(request: QueryRequest):
     """
     Issue a unique receipt number as a key and spool the query.
     """
+
     try:
         # Generate unique receipt number
         receipt_number = str(uuid.uuid4())
@@ -244,6 +381,19 @@ async def set_query(request: QueryRequest):
         
         if not success:
             raise HTTPException(status_code=500, detail="Failed to store query")
+        
+        # Immediately try to send to an available LLM server
+        query_sent = await llm_manager.send_query_to_available_server(query_data)
+        
+        if query_sent:
+            # Update status to processing
+            query_data["status"] = "processing"
+            await kv_set(receipt_number, json.dumps(query_data))
+            status = "sent_to_llm"
+        else:
+            status = "queued_no_llm_available"
+            await add_pending_count()
+            logger.warning(f"No LLM servers available for query: {receipt_number}")
         
         return QueueItem(
             receipt_number=receipt_number,
@@ -283,8 +433,10 @@ async def get_query():
                 "timestamp": queue_item["timestamp"]
             }
         }
-        await manager.send_answer(queue_item["receipt_number"], status_message)
+        # 非同期でWebSocketクライアントに通知
+        asyncio.create_task(manager.send_answer(queue_item["receipt_number"], status_message))
 
+        # APIレスポンスとしてクエリ情報を返す（LLMサーバー用）
         return QueueItem(
             receipt_number=queue_item["receipt_number"],
             query=queue_item["query"],
@@ -300,6 +452,7 @@ async def set_answer(request: AnswerRequest):
     """
     Store the answer for a given receipt number and notify WebSocket clients.
     """
+
     try:
         receipt_number = request.receipt_number
         timestamp = datetime.utcnow().isoformat()
@@ -369,6 +522,7 @@ async def get_answer(receipt_number: str):
                 detail=f"Query is {data['status']}, processing"
             )
         elif data["status"] == "completed":
+            await sub_pending_count()
             return AnswerResponse(
                 receipt_number=receipt_number,
                 answer=data.get("answer", ""),
@@ -424,3 +578,22 @@ async def websocket_status():
         },
         "total_receipts_with_connections": len(manager.active_connections)
     }
+
+# asyncioのロックを使用
+lock = asyncio.Lock()
+pending_count = 0
+async def add_pending_count():
+    global pending_count
+    async with lock:
+        pending_count += 1
+
+async def sub_pending_count():
+    global pending_count
+    async with lock:
+        if pending_count > 0:
+            pending_count -= 1
+
+async def set_pending_count(count: int):
+    global pending_count
+    async with lock:
+        pending_count = count
