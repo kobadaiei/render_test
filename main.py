@@ -6,7 +6,7 @@ import json
 import os
 # import httpx
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta
 import redis
 from dotenv import load_dotenv
 import asyncio
@@ -16,13 +16,16 @@ import time
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+# **** 本番 *****
 path = '/etc/secrets/.env'
+# **** ローカル *****
 # path = './.env'
+
 load_dotenv(path)
+# **** 本番 *****
 REDIS_URL = os.environ['REDIS_URL']
-# Render KV Store configuration
-# REDIS_URL = ''
+# **** ローカル *****
+# REDIS_URL = "rediss://***"
 kv_store = redis.from_url(REDIS_URL)
 
 app = FastAPI(title="LLM Query Management API", version="1.0.0")
@@ -162,6 +165,14 @@ class QueueItem(BaseModel):
     query: str
     timestamp: str
     status: str
+
+# 新しいレスポンスモデルを追加
+class QueueItemWithWaitCount(BaseModel):
+    receipt_number: str
+    query: str
+    timestamp: str
+    status: str
+    wait_count: int  # 自分以外の"queued", "processing"の数
 
 class WebSocketMessage(BaseModel):
     type: str  # "answer", "status", "error"
@@ -356,8 +367,53 @@ async def llm_websocket_endpoint(websocket: WebSocket, server_id: str):
     finally:
         llm_manager.disconnect(websocket)
 
+async def get_wait_count(exclude_receipt_number: str = None) -> int:
+    """自分以外の"queued", "processing"の数を取得"""
+    try:
+        count = 0
+        for key_bytes in kv_store.scan_iter():
+            key = key_bytes.decode() if isinstance(key_bytes, bytes) else str(key_bytes)
+            try:
+                item_data = kv_store.get(key)
+                if item_data:
+                    item = json.loads(item_data.decode())
+
+                    # timestampを取得（Noneの場合はスキップ）
+                    timestamp_str = item.get("timestamp")
+                    if not timestamp_str:
+                        logger.warning(f"No timestamp found for item {key}, skipping")
+                        continue
+                    
+                    # timestampをdatetimeオブジェクトに変換
+                    try:
+                        item_timestamp = datetime.fromisoformat(timestamp_str)
+                    except ValueError as e:
+                        logger.error(f"Invalid timestamp format for item {key}: {timestamp_str}, skipping")
+                        continue
+                    
+                    # timestampが60分以上前の場合はカウントしない
+                    cutoff_time = datetime.utcnow() - timedelta(minutes=60)
+                    if item_timestamp < cutoff_time:
+                        continue
+
+                    status = item.get("status", "")
+                    receipt_number = item.get("receipt_number", "")
+                    
+                    # 自分以外の "pending", "queued", "processing" をカウント
+                    if (status in ["pending", "queued", "processing"] and 
+                        receipt_number != exclude_receipt_number):
+                        count += 1
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                logger.error(f"Error processing item {key}: {e}")
+                continue
+        
+        return count
+    except Exception as e:
+        logger.error(f"Error getting wait count: {e}")
+        return 0
+    
 # API Endpoints
-@app.post("/set_query", response_model=QueueItem)
+@app.post("/set_query", response_model=QueueItemWithWaitCount)
 async def set_query(request: QueryRequest):
     """
     Issue a unique receipt number as a key and spool the query.
@@ -373,7 +429,7 @@ async def set_query(request: QueryRequest):
             "receipt_number": receipt_number,
             "query": request.query,
             "timestamp": timestamp,
-            "status": "pending",
+            "status": "queued",  # "pending"から"queued"に変更
         }
         
         # Store in KV store
@@ -391,15 +447,23 @@ async def set_query(request: QueryRequest):
             await kv_set(receipt_number, json.dumps(query_data))
             status = "sent_to_llm"
         else:
+            query_data["status"] = "pending"
+            await kv_set(receipt_number, json.dumps(query_data))
             status = "queued_no_llm_available"
             await add_pending_count()
             logger.warning(f"No LLM servers available for query: {receipt_number}")
         
-        return QueueItem(
+        # 待ち人数を計算（自分以外の"queued", "processing"の数）
+        # 少し待ってからカウントを取得（データベースの更新を待つ）
+        await asyncio.sleep(0.1)
+        wait_count = await get_wait_count(receipt_number)
+        
+        return QueueItemWithWaitCount(
             receipt_number=receipt_number,
             query=request.query,
             timestamp=timestamp,
-            status="queued"
+            status="queued",
+            wait_count=wait_count
         )
         
     except Exception as e:
@@ -418,7 +482,8 @@ async def get_query():
         if not pending_result:
             return None
         
-        queue_key, queue_item = pending_result
+        print(f"pending_result: {pending_result}")
+        queue_key, queue_item, pending_count = pending_result
 
         # Mark the item as processing
         queue_item["status"] = "processing"
@@ -561,6 +626,14 @@ async def get_status(receipt_number: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    
+# 登録してある keyvalue を全て削除
+@app.get("/delete_all_keyvalue")
+async def delete_all_keyvalue():
+    """Delete all keyvalue"""
+    for key in kv_store.scan_iter():
+        kv_store.delete(key)
+    return {"message": "All keyvalue deleted"}
 
 @app.get("/")
 async def root():
