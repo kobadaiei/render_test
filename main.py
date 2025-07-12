@@ -627,6 +627,34 @@ async def get_status(receipt_number: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
+# 受付番号キューをキャンセルする (status が "pending", "queued", "processing" の場合削除する)
+@app.get("/cancel_query/{receipt_number}")
+async def cancel_query(receipt_number: str):
+    """Cancel a query"""
+    data_str = await kv_get(receipt_number)
+        
+    if not data_str:
+        raise HTTPException(
+            status_code=404, 
+            detail="Receipt number not found"
+        )
+    try:
+        data = json.loads(data_str)
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=400, 
+            detail="cancel_query: Invalid JSON data"
+        )
+        
+    if data["status"] in ["pending", "queued", "processing"]:
+        await kv_delete(receipt_number)
+        return {"message": "Query cancelled"}
+    else:
+        raise HTTPException(
+            status_code=400, 
+            detail="Query is not pending, queued, or processing"
+        )
+
 # 登録してある keyvalue を全て削除
 @app.get("/delete_all_keyvalue")
 async def delete_all_keyvalue():
