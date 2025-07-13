@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 import asyncio
 import logging
 import time
+import requests
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
