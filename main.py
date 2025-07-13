@@ -28,6 +28,12 @@ REDIS_URL = os.environ['REDIS_URL']
 # REDIS_URL = "rediss://***"
 kv_store = redis.from_url(REDIS_URL)
 
+# Microsoft Graph API の設定
+TENANT_ID = os.environ['TENANT_ID']
+CLIENT_ID = os.environ['CLIENT_ID']
+CLIENT_KEY = os.environ['CLIENT_KEY']
+UPLOAD_ITEM_ID = os.environ['UPLOAD_ITEM_ID']
+
 app = FastAPI(title="LLM Query Management API", version="1.0.0")
 
 app.add_middleware(
@@ -37,6 +43,70 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Pydantic model for request validation
+class GoodButtonRequest(BaseModel):
+    receipt_number: str
+    status: str
+    content: str
+
+# Pydantic model for response
+class GoodButtonResponse(BaseModel):
+    success: bool
+    message: str
+    filename: Optional[str] = None
+
+def getToken() -> str:
+    """Microsoft Graph API のアクセストークンを取得"""
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded'
+    }
+
+    payload = {
+        'client_id': CLIENT_ID,
+        'scope': 'https://graph.microsoft.com/.default',
+        'grant_type': 'client_credentials',
+        'client_secret': CLIENT_KEY
+    }
+
+    TokenGet_URL = "https://login.microsoftonline.com/" + TENANT_ID + "/oauth2/v2.0/token"
+
+    response = requests.post(
+        TokenGet_URL,
+        headers=headers,
+        data=payload
+    )
+    
+    if response.status_code != 200:
+        raise Exception(f"Token request failed: {response.status_code} - {response.text}")
+    
+    jsonObj = json.loads(response.text)
+    token = jsonObj.get("access_token", None)
+    if token is None:
+        raise Exception("token is None")
+    return token
+
+def upload_json_to_onedrive(token: str, json_data: dict, upload_item_id: str, filename: str) -> bool:
+    """JSONデータをOneDriveにアップロード"""
+    try:
+        url = f"https://graph.microsoft.com/v1.0/sites/26ac19c0-6b34-4ba6-b66d-1901dda55bb1/drive/items/{upload_item_id}:/{filename}:/content"
+        headers = {
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'
+        }
+        
+        response = requests.put(url, headers=headers, data=json.dumps(json_data, ensure_ascii=False))
+        
+        if response.status_code != 200 and response.status_code != 201:
+            print(f"Upload failed: {response.status_code} - {response.text}")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        print(f"Upload error: {str(e)}")
+        return False
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -654,6 +724,48 @@ async def cancel_query(receipt_number: str):
             status_code=400, 
             detail="Query is not pending, queued, or processing"
         )
+    
+@app.post("/good-button", response_model=GoodButtonResponse)
+async def submit_good_button(request: GoodButtonRequest):
+    """
+    Good buttonの結果を受け付けてOneDriveに保存
+    
+    - **receipt_number**: 受付番号
+    - **status**: ステータス
+    - **content**: 内容
+    """
+    try:
+        # 現在時刻を取得
+        now = datetime.datetime.now()
+        datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # ファイル名を生成（受付番号）
+        filename = f"good_button_{request.receipt_number}.json"
+        
+        # JSONデータを構築
+        good_button_json = {
+            "receipt_number": request.receipt_number,
+            "datetime": datetime_str,
+            "status": request.status,
+            "content": request.content,
+        }
+        token = getToken()
+        if token is None:
+            raise HTTPException(status_code=500, detail="Failed to get token")
+        # OneDriveにアップロード
+        success = upload_json_to_onedrive(token, good_button_json, UPLOAD_ITEM_ID, filename)
+        
+        if success:
+            return GoodButtonResponse(
+                success=True,
+                message="Good button result saved successfully",
+                filename=filename
+            )
+        else:
+            raise HTTPException(status_code=500, detail="Failed to upload to OneDrive")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 # 登録してある keyvalue を全て削除
 @app.get("/delete_all_keyvalue")
