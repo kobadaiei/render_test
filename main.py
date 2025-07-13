@@ -736,7 +736,7 @@ async def submit_good_button(request: GoodButtonRequest):
     """
     try:
         # 現在時刻を取得
-        now = datetime.datetime.now()
+        now = datetime.now()
         datetime_str = now.strftime("%Y-%m-%d %H:%M:%S")
         
         # ファイル名を生成（受付番号）
