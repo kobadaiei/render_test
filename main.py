@@ -156,6 +156,38 @@ class ConnectionManager:
                 await kv_delete(receipt_number)
                 logger.info(f"Receipt number {receipt_number} deleted")
 
+    async def send_status(self, receipt_number: str, status: str, timestamp: str = None):
+        """Send status update to all clients waiting for this receipt number"""
+        if timestamp is None:
+            timestamp = datetime.utcnow().isoformat()
+        
+        status_data = {
+            "type": "status",
+            "receipt_number": receipt_number,
+            "data": {
+                "status": status,
+                "timestamp": timestamp
+            }
+        }
+
+        if receipt_number in self.active_connections:
+            connections_to_remove = []
+            for connection in self.active_connections[receipt_number]:
+                try:
+                    await connection.send_json(status_data)
+                    logger.info(f"Status update sent via WebSocket for receipt: {receipt_number}")
+                except Exception as e:
+                    logger.error(f"Error sending WebSocket status message: {e}")
+                    connections_to_remove.append(connection)
+            
+            # Remove failed connections
+            for connection in connections_to_remove:
+                self.active_connections[receipt_number].remove(connection)
+            
+            # Clean up empty connection lists
+            if not self.active_connections[receipt_number]:
+                del self.active_connections[receipt_number]
+
 class LLMConnectionManager:
     """Manages WebSocket connections for LLM servers"""
     def __init__(self):
@@ -230,6 +262,10 @@ class AnswerResponse(BaseModel):
 
 class QueryRequest(BaseModel):
     query: str
+
+class UpdateStatusRequest(BaseModel):
+    receipt_number: str
+    status: str
 
 class QueueItem(BaseModel):
     receipt_number: str
@@ -697,7 +733,21 @@ async def get_status(receipt_number: str):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# 受付番号キューを削除する
+@app.get("/delete_query/{receipt_number}")
+async def delete_query(receipt_number: str):
+    """Delete a query"""
+    data_str = await kv_get(receipt_number)
     
+    if not data_str:
+        raise HTTPException(
+            status_code=404, 
+            detail="Receipt number not found"
+        )
+    await kv_delete(receipt_number)
+    return {"message": f"Query {receipt_number} deleted"}
+
 # 受付番号キューをキャンセルする (status が "pending", "queued", "processing" の場合削除する)
 @app.get("/cancel_query/{receipt_number}")
 async def cancel_query(receipt_number: str):
@@ -725,6 +775,47 @@ async def cancel_query(receipt_number: str):
             status_code=400, 
             detail="Query is not pending, queued, or processing"
         )
+    
+@app.post("/update_status", response_model=Dict[str, str])
+async def update_status(request: UpdateStatusRequest):
+    """
+    Update the status of a query and notify WebSocket clients.
+    """
+    try:
+        receipt_number = request.receipt_number
+        new_status = request.status
+        timestamp = datetime.utcnow().isoformat()
+        
+        # Check if query exists
+        query_data_str = await kv_get(receipt_number)
+        if not query_data_str:
+            raise HTTPException(status_code=404, detail="Receipt number not found")
+        
+        # Parse existing data
+        try:
+            query_data = json.loads(query_data_str)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON data in store")
+        
+        # Update status
+        query_data["status"] = new_status
+        query_data["timestamp"] = timestamp
+        
+        # Store updated data
+        success = await kv_set(receipt_number, json.dumps(query_data))
+        
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to update status")
+        
+        # Notify WebSocket clients
+        await manager.send_status(receipt_number, new_status, timestamp)
+        
+        return {"status": "success", "message": f"Status updated to {new_status} and clients notified"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
     
 @app.post("/good-button", response_model=GoodButtonResponse)
 async def submit_good_button(request: GoodButtonRequest):
